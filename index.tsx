@@ -1,11 +1,12 @@
 import { LiveActivity, Script } from "scripting"
 import { ACTIVITY_NAME, BTCActivity } from "./live_activity"
 import type { BTCState } from "./live_activity"
-import { loadQuote, SOURCE_OPTIONS, testConnections } from "./quotes"
+import { loadQuote, QuoteUnavailableError, SOURCE_OPTIONS, testConnections } from "./quotes"
 import type { SourcePreference } from "./quotes"
 
 const RECORD_KEY = "btc.island.manual.v1"
 const SETTINGS_KEY = "btc.island.settings.v1"
+const VERSION = "1.1.1"
 
 type ActivityRecord = { id: string; state: BTCState }
 type Settings = { source: SourcePreference }
@@ -39,8 +40,12 @@ async function getSavedActivity() {
   const record = Storage.get<ActivityRecord>(RECORD_KEY)
   const status = record ? await LiveActivity.getActivityState(record.id) : null
   const activity = record && (status === "active" || status === "stale")
-    ? LiveActivity.from(record.id, ACTIVITY_NAME)
+    ? await LiveActivity.from(record.id, ACTIVITY_NAME)
     : null
+  if (activity && (typeof activity.update !== "function" ||
+                   typeof activity.end !== "function")) {
+    throw new Error("实时活动恢复结果缺少 update/end 方法，未执行刷新或停止。请提供本提示和 Scripting 应用版本，以便核对接口兼容性。")
+  }
   return { record, activity }
 }
 
@@ -97,7 +102,7 @@ async function run() {
   while (true) {
     const source = SOURCE_OPTIONS.find(option => option.id === settings.source)!
     const choice = await Dialog.actionSheet({
-      title: "BTC 灵动岛 v1.1.0",
+      title: `BTC 灵动岛 v${VERSION}`,
       message: `BTC/USDT 现货 · 两位小数 · 手动刷新\n当前来源：${source.label}`,
       cancelButton: true,
       actions: [
@@ -130,13 +135,16 @@ async function run() {
 
 async function main() {
   try {
-    console.log("BTC 灵动岛 v1.1.0：入口已启动")
+    console.log(`BTC 灵动岛 v${VERSION}：入口已启动`)
     await run()
   } catch (error) {
     console.error("BTC 灵动岛运行失败", error)
+    const quoteUnavailable = error instanceof QuoteUnavailableError
     await Dialog.alert({
-      title: "未能完成",
-      message: `${error instanceof Error ? error.message : String(error)}\n\n网络失败时，不会把旧价格当作新报价。`,
+      title: quoteUnavailable ? "行情暂不可用" : "脚本运行失败",
+      message: `${error instanceof Error ? error.message : String(error)}\n\n${quoteUnavailable
+        ? "本次未更新活动，不会把旧价格当作新报价。"
+        : "这是脚本或实时活动处理失败，不等于行情网络不可达。请保留本提示截图。"}`,
     })
   } finally {
     Script.exit()

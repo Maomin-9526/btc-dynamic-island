@@ -1,5 +1,12 @@
 import type { BTCState } from "./live_activity"
 
+export class QuoteUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "QuoteUnavailableError"
+  }
+}
+
 export type SourceId = "bitget" | "binance" | "okx"
 export type SourcePreference = SourceId | "auto"
 
@@ -148,7 +155,7 @@ export async function loadQuote(preference: SourcePreference) {
   const advice = preference === "auto"
     ? "当前网络没有取得可用报价。请检查 Scripting 的蜂窝数据权限，或换 Wi-Fi 再测试。多源不能保证所有国内运营商都能直连。"
     : "这个行情源在当前网络不可用。请到“行情源设置”选择自动模式或其他来源。"
-  throw new Error(`${advice}\n\n${failures.join("\n")}`)
+  throw new QuoteUnavailableError(`${advice}\n\n${failures.join("\n")}`)
 }
 
 export async function testConnections(): Promise<string[]> {

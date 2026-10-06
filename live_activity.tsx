@@ -20,7 +20,7 @@ export type BTCState = {
 
 function formatMinimalPrice(compactPrice: string) {
   const price = Number(compactPrice)
-  return Number.isFinite(price) && price > 0 ? Math.trunc(price).toString() : ""
+  return Number.isFinite(price) && price > 0 ? price.toFixed(2) : ""
 }
 
 function QuoteView(state: BTCState) {
@@ -49,7 +49,7 @@ const builder: LiveActivityUIBuilder<BTCState> = state => (
       </Text>
     }
     minimal={
-      <Text font={10} foregroundStyle="orange" monospacedDigit lineLimit={1} minScaleFactor={0.5}>
+      <Text font={9} foregroundStyle="orange" monospacedDigit lineLimit={1} minScaleFactor={0.5}>
         {formatMinimalPrice(state.compactPrice)}
       </Text>
     }

@@ -1,6 +1,8 @@
-import { BackgroundKeeper, LiveActivity, Script } from "scripting"
+import { LiveActivity, Script } from "scripting"
 import { createRefreshLoop, REFRESH_SECONDS } from "./auto_refresh"
 import type { RefreshLoop } from "./auto_refresh"
+import { BackgroundLocationError, startBackgroundLocation } from "./background_location"
+import type { BackgroundLocationSession } from "./background_location"
 import { ACTIVITY_NAME, BTCActivity } from "./live_activity"
 import type { BTCState } from "./live_activity"
 import { loadQuote, QuoteUnavailableError, SOURCE_OPTIONS, testConnections } from "./quotes"
@@ -8,7 +10,7 @@ import type { SourcePreference } from "./quotes"
 
 const RECORD_KEY = "btc.island.manual.v1"
 const SETTINGS_KEY = "btc.island.settings.v1"
-const VERSION = "1.3.0"
+const VERSION = "1.4.0"
 
 type ActivityRecord = { id: string; state: BTCState }
 type Settings = { source: SourcePreference }
@@ -106,8 +108,7 @@ async function run() {
   let menuOpen = false
   let stopping = false
   let finished = false
-  let keepAliveRequested = false
-  let backgroundEnabled = false
+  let backgroundLocation: BackgroundLocationSession | null = null
   let lastError = ""
   let finishSession!: () => void
   const session = new Promise<void>(resolve => { finishSession = resolve })
@@ -117,8 +118,27 @@ async function run() {
     finishSession()
   }
 
+  async function releaseLocation() {
+    const activeLocation = backgroundLocation
+    backgroundLocation = null
+    await activeLocation?.stop()
+  }
+
   async function stopRefreshing() {
-    await loop?.stop()
+    const stopped = loop?.stop()
+    try {
+      await releaseLocation()
+    } finally {
+      await stopped
+    }
+  }
+
+  function locationStatus() {
+    if (!backgroundLocation) return "定位未启用 · 仅前台刷新"
+    const lastUpdate = backgroundLocation.lastUpdateTime
+    return `实验定位已请求（不代表后台验证成功）\n${lastUpdate === null
+      ? "尚未收到定位回调"
+      : `最近定位回调：${Math.max(0, Math.floor((Date.now() - lastUpdate) / 1000))} 秒前`}`
   }
 
   async function minimize() {
@@ -128,21 +148,22 @@ async function run() {
     }
   }
 
-  async function startAutomaticRefresh() {
+  async function startAutomaticRefresh(useLocation = true) {
     if (typeof Script.onResume !== "function") {
       throw new Error("当前 Scripting 版本缺少脚本恢复接口，请更新 Scripting 后重试，以便自动运行时还能打开停止菜单。")
     }
 
-    const quote = await refreshActivity(settings)
-    if (!quote) return
-    if (typeof BackgroundKeeper !== "undefined" &&
-        typeof BackgroundKeeper.keepAlive === "function") {
-      keepAliveRequested = true
-      try {
-        backgroundEnabled = await BackgroundKeeper.keepAlive()
-      } catch (error) {
-        console.error("后台保活未启用，使用前台自动刷新", error)
+    let quote: Awaited<ReturnType<typeof refreshActivity>>
+    try {
+      if (useLocation) backgroundLocation = await startBackgroundLocation()
+      quote = await refreshActivity(settings)
+      if (!quote) {
+        await releaseLocation()
+        return
       }
+    } catch (error) {
+      await releaseLocation()
+      throw error
     }
 
     loop = createRefreshLoop(async () => {
@@ -163,10 +184,10 @@ async function run() {
     })
 
     await Dialog.alert({
-      title: backgroundEnabled ? "已开启自动刷新" : "已开启前台自动刷新",
-      message: `${quote.state.price} USDT\n24h ${quote.state.change}\n行情时间 ${quote.state.time}\n来源 ${quote.state.source}\n接口 ${quote.host} · ${quote.transport}\n\n每轮完成后间隔 ${REFRESH_SECONDS} 秒刷新；失败保留旧价格并自动重试，不重复弹窗。\n\n${backgroundEnabled
-        ? "已请求后台保活，可返回主屏幕查看。iOS 仍可能暂停或终止运行；不要强制关闭 Scripting。"
-        : "后台保活未启用，可能需要 Scripting Pro 或更新应用。本次仅在脚本获得运行时间时自动刷新；切后台或锁屏后可能暂停。"}\n\n重新运行本脚本可打开菜单；选“停止自动刷新 / 隐藏价格”即可停止。请以行情时间判断报价是否更新。`,
+      title: backgroundLocation ? "已开启实验定位刷新" : "已开启前台自动刷新",
+      message: `${quote.state.price} USDT\n24h ${quote.state.change}\n行情时间 ${quote.state.time}\n来源 ${quote.state.source}\n接口 ${quote.host} · ${quote.transport}\n\n每轮完成后间隔 ${REFRESH_SECONDS} 秒刷新；失败保留旧价格并自动重试，不重复弹窗。\n\n${backgroundLocation
+        ? "已确认始终定位权限并请求后台定位；不读取、保存或上传经纬度。定位会增加耗电并保留系统指示。这不是 APNs 推送，也不保证切换 App 后持续运行；需真机验证。"
+        : "未请求定位，也不调用 Pro 后台保活。本次仅在脚本获得运行时间时自动刷新；切后台后可能暂停。"}\n\n重新运行本脚本可打开菜单，关闭定位或停止刷新。不要强制关闭 Scripting；以行情时间而非价格是否变化判断是否更新。`,
       buttonLabel: "开始查看",
     })
   }
@@ -180,13 +201,16 @@ async function run() {
         const choice = await Dialog.actionSheet({
           title: `BTC 灵动岛 v${VERSION}`,
           message: `BTC/USDT 现货 · 两位小数 · ${REFRESH_SECONDS} 秒刷新间隔\n当前来源：${source.label}\n${loop?.running
-            ? `自动刷新已启动 · ${backgroundEnabled ? "已请求后台保活" : "后台保活未启用"}`
-            : "自动刷新未启动"}${lastError ? `\n最近刷新失败，正在重试：${lastError.slice(0, 180)}` : ""}\n系统可能暂停后台运行，请以行情时间为准。`,
+            ? `自动刷新已启动 · ${locationStatus()}`
+            : "未启动；可选择实验定位后台刷新，或不定位的前台刷新。"}${lastError ? `\n最近刷新失败，正在重试：${lastError.slice(0, 180)}` : ""}\n实验模式需始终允许定位，会增加耗电；不保存或上传位置。请勿同时运行其他连续定位脚本。系统仍可能暂停，请以行情时间为准。`,
           cancelButton: true,
           actions: [
-            { label: loop?.running ? "继续自动刷新（返回查看）" : "开始显示 / 开启自动刷新" },
+            { label: loop?.running ? "继续自动刷新（返回查看）" : "开始显示 / 实验定位后台刷新" },
             { label: "行情源设置" },
             { label: "测试当前网络（不更新价格）" },
+            { label: loop?.running
+              ? backgroundLocation ? "关闭定位 / 切为前台刷新" : "开启实验定位后台刷新"
+              : "开始显示 / 仅前台刷新（不定位）" },
             { label: "停止自动刷新 / 隐藏价格", destructive: true },
           ],
         })
@@ -210,9 +234,27 @@ async function run() {
             buttonLabel: "返回菜单",
           })
         } else if (choice === 3) {
+          if (!loop?.running) {
+            await startAutomaticRefresh(false)
+            await minimize()
+            return
+          }
+          if (backgroundLocation) {
+            await releaseLocation()
+            await Dialog.alert({ title: "实验定位已关闭", message: "已释放定位请求，行情循环仍保留。本次改为仅前台刷新，切换 App 后可能暂停。" })
+          } else {
+            backgroundLocation = await startBackgroundLocation()
+            await Dialog.alert({ title: "实验定位已请求", message: "已确认始终定位权限并请求后台定位，不保存或上传位置。定位会增加耗电；这不是推送，后台效果需真机验证。" })
+          }
+          await minimize()
+          return
+        } else if (choice === 4) {
           stopping = true
-          await stopRefreshing()
-          await stopActivity()
+          try {
+            await stopRefreshing()
+          } finally {
+            await stopActivity()
+          }
           finish()
           return
         }
@@ -240,14 +282,10 @@ async function run() {
     await session
   } finally {
     stopping = true
-    removeResume()
-    await stopRefreshing()
-    if (keepAliveRequested) {
-      try {
-        await BackgroundKeeper.stopKeepAlive()
-      } catch (error) {
-        console.error("释放后台保活请求失败，脚本仍将退出", error)
-      }
+    try {
+      removeResume()
+    } finally {
+      await stopRefreshing()
     }
   }
 }
@@ -255,10 +293,12 @@ async function run() {
 async function reportError(error: unknown) {
   console.error("BTC 灵动岛运行失败", error)
   const quoteUnavailable = error instanceof QuoteUnavailableError
+  const locationUnavailable = error instanceof BackgroundLocationError
   await Dialog.alert({
-    title: quoteUnavailable ? "行情暂不可用" : "脚本运行失败",
+    title: quoteUnavailable ? "行情暂不可用" : locationUnavailable ? "实验定位失败" : "脚本运行失败",
     message: `${error instanceof Error ? error.message : String(error)}\n\n${quoteUnavailable
       ? "本次未更新活动，不会把旧价格当作新报价。"
+      : locationUnavailable ? "不代表行情接口故障；不会调用 Pro 后台保活，也不会自动购买服务。"
       : "这是脚本或实时活动处理失败，不等于行情网络不可达。请保留本提示截图。"}`,
   })
 }

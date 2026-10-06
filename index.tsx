@@ -6,7 +6,7 @@ import type { SourcePreference } from "./quotes"
 
 const RECORD_KEY = "btc.island.manual.v1"
 const SETTINGS_KEY = "btc.island.settings.v1"
-const VERSION = "1.1.1"
+const VERSION = "1.2.0"
 
 type ActivityRecord = { id: string; state: BTCState }
 type Settings = { source: SourcePreference }
@@ -21,7 +21,7 @@ function readSettings(): Settings {
 async function chooseSource(settings: Settings): Promise<Settings> {
   const choice = await Dialog.actionSheet({
     title: "行情源设置",
-    message: "自动模式依次尝试 Bitget、币安行情专用域名、币安主域名、OKX。固定来源不会偷偷切到其他交易所。国内可达性以本机网络测试为准。",
+    message: "BG 优先用官方 WebSocket，OKX 优先用专用 API 域名，并在同一交易所内尝试备用通道。固定来源不会切到其他交易所；自动模式按 BG、币安、OKX 尝试。国内可达性仍需本机测试。",
     cancelButton: true,
     actions: SOURCE_OPTIONS.map(option => ({
       label: `${settings.source === option.id ? "✓ " : ""}${option.label}`,
@@ -62,7 +62,7 @@ async function refreshActivity(settings: Settings) {
   if (!await LiveActivity.areActivitiesEnabled()) {
     throw new Error("请在设置 → App → Scripting 中允许实时活动，再运行。")
   }
-  const { state, host, failures } = await loadQuote(settings.source)
+  const { state, host, transport, failures } = await loadQuote(settings.source)
   const { record, activity } = await getSavedActivity()
   const options = { staleDate: Date.now() + 120000 }
 
@@ -92,7 +92,7 @@ async function refreshActivity(settings: Settings) {
 
   await Dialog.alert({
     title: "已更新 BTC 行情",
-    message: `${state.price} USDT\n24h ${state.change}\n行情时间 ${state.time}\n来源 ${state.source}\n接口 ${host}${failures.length ? `\n已跳过 ${failures.length} 个不可用接口` : ""}\n\n灵动岛保留两位小数。返回主屏幕查看；下次运行本脚本即可刷新。`,
+    message: `${state.price} USDT\n24h ${state.change}\n行情时间 ${state.time}\n来源 ${state.source}\n接口 ${host} · ${transport}${failures.length ? `\n已跳过 ${failures.length} 个不可用通道` : ""}\n\n灵动岛保留两位小数。返回主屏幕查看；下次运行本脚本即可刷新。`,
     buttonLabel: "完成",
   })
 }
@@ -103,7 +103,7 @@ async function run() {
     const source = SOURCE_OPTIONS.find(option => option.id === settings.source)!
     const choice = await Dialog.actionSheet({
       title: `BTC 灵动岛 v${VERSION}`,
-      message: `BTC/USDT 现货 · 两位小数 · 手动刷新\n当前来源：${source.label}`,
+      message: `BTC/USDT 现货 · 两位小数 · 手动刷新\n当前来源：${source.label}\n网络测试仅检测所选来源；自动模式检测全部来源。`,
       cancelButton: true,
       actions: [
         { label: "开始显示 / 刷新价格" },
@@ -120,7 +120,7 @@ async function run() {
     if (choice === 1) {
       settings = await chooseSource(settings)
     } else if (choice === 2) {
-      const results = await testConnections()
+      const results = await testConnections(settings.source)
       await Dialog.alert({
         title: "当前网络测试结果",
         message: `${results.join("\n\n")}\n\n这只代表此刻本机的连通性，不保证长期可用。测试不会修改行情源或灵动岛价格。`,

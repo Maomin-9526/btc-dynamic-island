@@ -1,72 +1,64 @@
 import { LiveActivity, Script } from "scripting"
 import { ACTIVITY_NAME, BTCActivity } from "./live_activity"
 import type { BTCState } from "./live_activity"
+import { loadQuote, SOURCE_OPTIONS, testConnections } from "./quotes"
+import type { SourcePreference } from "./quotes"
 
 const RECORD_KEY = "btc.island.manual.v1"
-const QUOTE_URL = "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT"
+const SETTINGS_KEY = "btc.island.settings.v1"
 
 type ActivityRecord = { id: string; state: BTCState }
+type Settings = { source: SourcePreference }
 
-async function loadQuote(): Promise<BTCState> {
-  const response = await fetch(QUOTE_URL, { timeout: 12 })
-  if (!response.ok) throw new Error(`行情请求失败：HTTP ${response.status}`)
-  const payload = await response.json()
-  const ticker = payload.data?.[0]
-  if (payload.code !== "0" || ticker?.instId !== "BTC-USDT") {
-    throw new Error(payload.msg || "行情接口返回了无效数据")
-  }
-  const price = Number(ticker.last)
-  const opening = Number(ticker.open24h)
-  const timestamp = Number(ticker.ts)
-  if (![price, opening, timestamp].every(Number.isFinite) ||
-      price <= 0 || opening <= 0 || timestamp <= 0) {
-    throw new Error("行情价格或时间无效")
-  }
-  if (Date.now() - timestamp > 300000) {
-    throw new Error("行情数据超过 5 分钟，拒绝显示为新报价")
-  }
-  const change = (price / opening - 1) * 100
-  return {
-    price: price.toLocaleString("en-US", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }),
-    compactPrice: String(Math.round(price)),
-    change: `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`,
-    time: new Date(timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
-  }
+function readSettings(): Settings {
+  const saved = Storage.get<Settings>(SETTINGS_KEY)
+  return SOURCE_OPTIONS.some(option => option.id === saved?.source)
+    ? { source: saved!.source }
+    : { source: "auto" }
 }
 
-async function run() {
+async function chooseSource(settings: Settings): Promise<Settings> {
   const choice = await Dialog.actionSheet({
-    title: "BTC 灵动岛 v1.0.1",
-    message: "BTC/USDT · OKX 公共行情。此版本仅手动刷新。",
-    actions: [
-      { label: "开始显示 / 刷新价格" },
-      { label: "停止显示", destructive: true },
-    ],
+    title: "行情源设置",
+    message: "自动模式依次尝试 Bitget、币安行情专用域名、币安主域名、OKX。固定来源不会偷偷切到其他交易所。国内可达性以本机网络测试为准。",
+    cancelButton: true,
+    actions: SOURCE_OPTIONS.map(option => ({
+      label: `${settings.source === option.id ? "✓ " : ""}${option.label}`,
+    })),
   })
-  if (choice == null) return
+  const selected = choice == null ? null : SOURCE_OPTIONS[choice]
+  if (!selected) return settings
+  const updated = { source: selected.id }
+  if (!Storage.set(SETTINGS_KEY, updated)) {
+    throw new Error("无法保存行情源设置，请检查 Scripting 存储后重试。")
+  }
+  return updated
+}
 
+async function getSavedActivity() {
   const record = Storage.get<ActivityRecord>(RECORD_KEY)
   const status = record ? await LiveActivity.getActivityState(record.id) : null
   const activity = record && (status === "active" || status === "stale")
     ? LiveActivity.from(record.id, ACTIVITY_NAME)
     : null
+  return { record, activity }
+}
 
-  if (choice === 1) {
-    if (activity && record) {
-      await activity.end(record.state, { dismissTimeInterval: 0 })
-    }
-    Storage.remove(RECORD_KEY)
-    await Dialog.alert({ title: "BTC 灵动岛", message: "已停止显示。" })
-    return
+async function stopActivity() {
+  const { record, activity } = await getSavedActivity()
+  if (activity && record) {
+    await activity.end(record.state, { dismissTimeInterval: 0 })
   }
+  Storage.remove(RECORD_KEY)
+  await Dialog.alert({ title: "BTC 灵动岛", message: "已停止显示。" })
+}
 
+async function refreshActivity(settings: Settings) {
   if (!await LiveActivity.areActivitiesEnabled()) {
     throw new Error("请在设置 → App → Scripting 中允许实时活动，再运行。")
   }
-  const state = await loadQuote()
+  const { state, host, failures } = await loadQuote(settings.source)
+  const { record, activity } = await getSavedActivity()
   const options = { staleDate: Date.now() + 120000 }
 
   if (activity && record) {
@@ -95,14 +87,50 @@ async function run() {
 
   await Dialog.alert({
     title: "已更新 BTC 行情",
-    message: `${state.price} USDT\n24h ${state.change}\n行情时间 ${state.time}\n\n返回主屏幕查看；下次运行本脚本即可刷新。`,
+    message: `${state.price} USDT\n24h ${state.change}\n行情时间 ${state.time}\n来源 ${state.source}\n接口 ${host}${failures.length ? `\n已跳过 ${failures.length} 个不可用接口` : ""}\n\n灵动岛保留两位小数。返回主屏幕查看；下次运行本脚本即可刷新。`,
     buttonLabel: "完成",
   })
 }
 
+async function run() {
+  let settings = readSettings()
+  while (true) {
+    const source = SOURCE_OPTIONS.find(option => option.id === settings.source)!
+    const choice = await Dialog.actionSheet({
+      title: "BTC 灵动岛 v1.1.0",
+      message: `BTC/USDT 现货 · 两位小数 · 手动刷新\n当前来源：${source.label}`,
+      cancelButton: true,
+      actions: [
+        { label: "开始显示 / 刷新价格" },
+        { label: "行情源设置" },
+        { label: "测试当前网络（不更新价格）" },
+        { label: "停止显示", destructive: true },
+      ],
+    })
+    if (choice == null) return
+    if (choice === 0) {
+      await refreshActivity(settings)
+      return
+    }
+    if (choice === 1) {
+      settings = await chooseSource(settings)
+    } else if (choice === 2) {
+      const results = await testConnections()
+      await Dialog.alert({
+        title: "当前网络测试结果",
+        message: `${results.join("\n\n")}\n\n这只代表此刻本机的连通性，不保证长期可用。测试不会修改行情源或灵动岛价格。`,
+        buttonLabel: "返回菜单",
+      })
+    } else if (choice === 3) {
+      await stopActivity()
+      return
+    }
+  }
+}
+
 async function main() {
   try {
-    console.log("BTC 灵动岛 v1.0.1：入口已启动")
+    console.log("BTC 灵动岛 v1.1.0：入口已启动")
     await run()
   } catch (error) {
     console.error("BTC 灵动岛运行失败", error)

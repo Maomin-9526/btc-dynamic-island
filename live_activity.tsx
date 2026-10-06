@@ -14,12 +14,13 @@ export type BTCState = {
   compactPrice: string
   change: string
   time: string
+  source?: string
 }
 
 function QuoteView(state: BTCState) {
   return (
     <VStack>
-      <Text font="headline">BTC / USDT · OKX</Text>
+      <Text font="headline">BTC / USDT · {state.source || "OKX"}</Text>
       <Text font={22} bold monospacedDigit>{state.price} USDT</Text>
       <Text foregroundStyle={state.change.startsWith("-") ? "red" : "green"}>
         24h {state.change}
@@ -34,7 +35,7 @@ const builder: LiveActivityUIBuilder<BTCState> = state => (
     content={<QuoteView {...state} />}
     compactLeading={<Text foregroundStyle="orange">₿</Text>}
     compactTrailing={
-      <Text font={13} monospacedDigit lineLimit={1} minScaleFactor={0.6}>
+      <Text font={12} monospacedDigit lineLimit={1} minScaleFactor={0.5}>
         {state.compactPrice}
       </Text>
     }

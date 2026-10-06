@@ -15,6 +15,12 @@ export type BTCState = {
   change: string
   time: string
   source?: string
+  refreshSeconds?: number
+}
+
+function formatMinimalPrice(compactPrice: string) {
+  const price = Number(compactPrice)
+  return Number.isFinite(price) && price > 0 ? Math.trunc(price).toString() : ""
 }
 
 function QuoteView(state: BTCState) {
@@ -25,7 +31,10 @@ function QuoteView(state: BTCState) {
       <Text foregroundStyle={state.change.startsWith("-") ? "red" : "green"}>
         24h {state.change}
       </Text>
-      <Text font="caption">行情时间 {state.time} · 手动刷新</Text>
+      <Text font="caption">行情时间 {state.time}</Text>
+      <Text font="caption">
+        {state.refreshSeconds ? `${state.refreshSeconds} 秒刷新间隔 · 以行情时间为准` : "手动刷新"}
+      </Text>
     </VStack>
   )
 }
@@ -39,7 +48,11 @@ const builder: LiveActivityUIBuilder<BTCState> = state => (
         {state.compactPrice}
       </Text>
     }
-    minimal={<Text foregroundStyle="orange">₿</Text>}
+    minimal={
+      <Text font={10} foregroundStyle="orange" monospacedDigit lineLimit={1} minScaleFactor={0.5}>
+        {formatMinimalPrice(state.compactPrice)}
+      </Text>
+    }
   >
     <LiveActivityUIExpandedCenter>
       <QuoteView {...state} />

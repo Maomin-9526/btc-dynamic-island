@@ -1,4 +1,6 @@
-import { LiveActivity, Script } from "scripting"
+import { BackgroundKeeper, LiveActivity, Script } from "scripting"
+import { createRefreshLoop, REFRESH_SECONDS } from "./auto_refresh"
+import type { RefreshLoop } from "./auto_refresh"
 import { ACTIVITY_NAME, BTCActivity } from "./live_activity"
 import type { BTCState } from "./live_activity"
 import { loadQuote, QuoteUnavailableError, SOURCE_OPTIONS, testConnections } from "./quotes"
@@ -6,7 +8,7 @@ import type { SourcePreference } from "./quotes"
 
 const RECORD_KEY = "btc.island.manual.v1"
 const SETTINGS_KEY = "btc.island.settings.v1"
-const VERSION = "1.2.0"
+const VERSION = "1.3.0"
 
 type ActivityRecord = { id: string; state: BTCState }
 type Settings = { source: SourcePreference }
@@ -58,17 +60,22 @@ async function stopActivity() {
   await Dialog.alert({ title: "BTC 灵动岛", message: "已停止显示。" })
 }
 
-async function refreshActivity(settings: Settings) {
+async function refreshActivity(settings: Settings, allowStart = true) {
   if (!await LiveActivity.areActivitiesEnabled()) {
     throw new Error("请在设置 → App → Scripting 中允许实时活动，再运行。")
   }
-  const { state, host, transport, failures } = await loadQuote(settings.source)
+  if (!allowStart && !(await getSavedActivity()).activity) return null
+  const quote = await loadQuote(settings.source)
+  const state = { ...quote.state, refreshSeconds: REFRESH_SECONDS }
   const { record, activity } = await getSavedActivity()
+  if (!activity && !allowStart) return null
   const options = { staleDate: Date.now() + 120000 }
 
   if (activity && record) {
     await activity.update(state, options)
-    Storage.set(RECORD_KEY, { id: record.id, state })
+    if (!Storage.set(RECORD_KEY, { id: record.id, state })) {
+      throw new Error("无法保存活动状态，请检查 Scripting 存储后重试。")
+    }
   } else {
     const previousIds = new Set(await LiveActivity.getAllActivitiesIds())
     const freshActivity = BTCActivity()
@@ -90,47 +97,170 @@ async function refreshActivity(settings: Settings) {
     }
   }
 
-  await Dialog.alert({
-    title: "已更新 BTC 行情",
-    message: `${state.price} USDT\n24h ${state.change}\n行情时间 ${state.time}\n来源 ${state.source}\n接口 ${host} · ${transport}${failures.length ? `\n已跳过 ${failures.length} 个不可用通道` : ""}\n\n灵动岛保留两位小数。返回主屏幕查看；下次运行本脚本即可刷新。`,
-    buttonLabel: "完成",
-  })
+  return { ...quote, state }
 }
 
 async function run() {
   let settings = readSettings()
-  while (true) {
-    const source = SOURCE_OPTIONS.find(option => option.id === settings.source)!
-    const choice = await Dialog.actionSheet({
-      title: `BTC 灵动岛 v${VERSION}`,
-      message: `BTC/USDT 现货 · 两位小数 · 手动刷新\n当前来源：${source.label}\n网络测试仅检测所选来源；自动模式检测全部来源。`,
-      cancelButton: true,
-      actions: [
-        { label: "开始显示 / 刷新价格" },
-        { label: "行情源设置" },
-        { label: "测试当前网络（不更新价格）" },
-        { label: "停止显示", destructive: true },
-      ],
-    })
-    if (choice == null) return
-    if (choice === 0) {
-      await refreshActivity(settings)
-      return
-    }
-    if (choice === 1) {
-      settings = await chooseSource(settings)
-    } else if (choice === 2) {
-      const results = await testConnections(settings.source)
-      await Dialog.alert({
-        title: "当前网络测试结果",
-        message: `${results.join("\n\n")}\n\n这只代表此刻本机的连通性，不保证长期可用。测试不会修改行情源或灵动岛价格。`,
-        buttonLabel: "返回菜单",
-      })
-    } else if (choice === 3) {
-      await stopActivity()
-      return
+  let loop: RefreshLoop | null = null
+  let menuOpen = false
+  let stopping = false
+  let finished = false
+  let keepAliveRequested = false
+  let backgroundEnabled = false
+  let lastError = ""
+  let finishSession!: () => void
+  const session = new Promise<void>(resolve => { finishSession = resolve })
+
+  function finish() {
+    finished = true
+    finishSession()
+  }
+
+  async function stopRefreshing() {
+    await loop?.stop()
+  }
+
+  async function minimize() {
+    if (typeof Script.supportsMinimization === "function" &&
+        typeof Script.minimize === "function" && Script.supportsMinimization()) {
+      await Script.minimize()
     }
   }
+
+  async function startAutomaticRefresh() {
+    if (typeof Script.onResume !== "function") {
+      throw new Error("当前 Scripting 版本缺少脚本恢复接口，请更新 Scripting 后重试，以便自动运行时还能打开停止菜单。")
+    }
+
+    const quote = await refreshActivity(settings)
+    if (!quote) return
+    if (typeof BackgroundKeeper !== "undefined" &&
+        typeof BackgroundKeeper.keepAlive === "function") {
+      keepAliveRequested = true
+      try {
+        backgroundEnabled = await BackgroundKeeper.keepAlive()
+      } catch (error) {
+        console.error("后台保活未启用，使用前台自动刷新", error)
+      }
+    }
+
+    loop = createRefreshLoop(async () => {
+      if (menuOpen) return true
+      const updated = await refreshActivity(settings, false)
+      if (!updated) return false
+      lastError = ""
+      return true
+    }, error => {
+      lastError = error instanceof Error ? error.message : String(error)
+      console.error("本轮自动刷新失败，保留旧报价并在下一轮重试", error)
+    })
+    void loop.done.then(() => {
+      if (!menuOpen && !stopping) finish()
+    }, error => {
+      console.error("自动刷新循环已停止", error)
+      if (!menuOpen && !stopping) finish()
+    })
+
+    await Dialog.alert({
+      title: backgroundEnabled ? "已开启自动刷新" : "已开启前台自动刷新",
+      message: `${quote.state.price} USDT\n24h ${quote.state.change}\n行情时间 ${quote.state.time}\n来源 ${quote.state.source}\n接口 ${quote.host} · ${quote.transport}\n\n每轮完成后间隔 ${REFRESH_SECONDS} 秒刷新；失败保留旧价格并自动重试，不重复弹窗。\n\n${backgroundEnabled
+        ? "已请求后台保活，可返回主屏幕查看。iOS 仍可能暂停或终止运行；不要强制关闭 Scripting。"
+        : "后台保活未启用，可能需要 Scripting Pro 或更新应用。本次仅在脚本获得运行时间时自动刷新；切后台或锁屏后可能暂停。"}\n\n重新运行本脚本可打开菜单；选“停止自动刷新 / 隐藏价格”即可停止。请以行情时间判断报价是否更新。`,
+      buttonLabel: "开始查看",
+    })
+  }
+
+  async function showMenu() {
+    if (menuOpen || finished) return
+    menuOpen = true
+    try {
+      while (!finished) {
+        const source = SOURCE_OPTIONS.find(option => option.id === settings.source)!
+        const choice = await Dialog.actionSheet({
+          title: `BTC 灵动岛 v${VERSION}`,
+          message: `BTC/USDT 现货 · 两位小数 · ${REFRESH_SECONDS} 秒刷新间隔\n当前来源：${source.label}\n${loop?.running
+            ? `自动刷新已启动 · ${backgroundEnabled ? "已请求后台保活" : "后台保活未启用"}`
+            : "自动刷新未启动"}${lastError ? `\n最近刷新失败，正在重试：${lastError.slice(0, 180)}` : ""}\n系统可能暂停后台运行，请以行情时间为准。`,
+          cancelButton: true,
+          actions: [
+            { label: loop?.running ? "继续自动刷新（返回查看）" : "开始显示 / 开启自动刷新" },
+            { label: "行情源设置" },
+            { label: "测试当前网络（不更新价格）" },
+            { label: "停止自动刷新 / 隐藏价格", destructive: true },
+          ],
+        })
+        if (choice == null) {
+          if (loop?.running) await minimize()
+          else finish()
+          return
+        }
+        if (choice === 0) {
+          if (!loop?.running) await startAutomaticRefresh()
+          await minimize()
+          return
+        }
+        if (choice === 1) {
+          settings = await chooseSource(settings)
+        } else if (choice === 2) {
+          const results = await testConnections(settings.source)
+          await Dialog.alert({
+            title: "当前网络测试结果",
+            message: `${results.join("\n\n")}\n\n这只代表此刻本机的连通性，不保证长期可用。测试不会修改行情源或灵动岛价格。`,
+            buttonLabel: "返回菜单",
+          })
+        } else if (choice === 3) {
+          stopping = true
+          await stopRefreshing()
+          await stopActivity()
+          finish()
+          return
+        }
+      }
+    } catch (error) {
+      await reportError(error)
+      if (stopping || !loop?.running) finish()
+    } finally {
+      menuOpen = false
+      if (!loop?.running) finish()
+    }
+  }
+
+  const removeResume = typeof Script.onResume === "function"
+    ? Script.onResume(() => {
+      void showMenu().catch(error => {
+        console.error("无法显示自动刷新控制菜单", error)
+        finish()
+      })
+    })
+    : () => {}
+
+  try {
+    await showMenu()
+    await session
+  } finally {
+    stopping = true
+    removeResume()
+    await stopRefreshing()
+    if (keepAliveRequested) {
+      try {
+        await BackgroundKeeper.stopKeepAlive()
+      } catch (error) {
+        console.error("释放后台保活请求失败，脚本仍将退出", error)
+      }
+    }
+  }
+}
+
+async function reportError(error: unknown) {
+  console.error("BTC 灵动岛运行失败", error)
+  const quoteUnavailable = error instanceof QuoteUnavailableError
+  await Dialog.alert({
+    title: quoteUnavailable ? "行情暂不可用" : "脚本运行失败",
+    message: `${error instanceof Error ? error.message : String(error)}\n\n${quoteUnavailable
+      ? "本次未更新活动，不会把旧价格当作新报价。"
+      : "这是脚本或实时活动处理失败，不等于行情网络不可达。请保留本提示截图。"}`,
+  })
 }
 
 async function main() {
@@ -138,14 +268,7 @@ async function main() {
     console.log(`BTC 灵动岛 v${VERSION}：入口已启动`)
     await run()
   } catch (error) {
-    console.error("BTC 灵动岛运行失败", error)
-    const quoteUnavailable = error instanceof QuoteUnavailableError
-    await Dialog.alert({
-      title: quoteUnavailable ? "行情暂不可用" : "脚本运行失败",
-      message: `${error instanceof Error ? error.message : String(error)}\n\n${quoteUnavailable
-        ? "本次未更新活动，不会把旧价格当作新报价。"
-        : "这是脚本或实时活动处理失败，不等于行情网络不可达。请保留本提示截图。"}`,
-    })
+    await reportError(error)
   } finally {
     Script.exit()
   }

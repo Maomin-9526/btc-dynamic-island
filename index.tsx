@@ -1,5 +1,6 @@
-import { Dialog, LiveActivity, Script, Storage } from "scripting"
-import { ACTIVITY_NAME, BTCActivity, BTCState } from "./live_activity"
+import { LiveActivity, Script } from "scripting"
+import { ACTIVITY_NAME, BTCActivity } from "./live_activity"
+import type { BTCState } from "./live_activity"
 
 const RECORD_KEY = "btc.island.manual.v1"
 const QUOTE_URL = "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT"
@@ -38,7 +39,7 @@ async function loadQuote(): Promise<BTCState> {
 
 async function run() {
   const choice = await Dialog.actionSheet({
-    title: "BTC 灵动岛",
+    title: "BTC 灵动岛 v1.0.1",
     message: "BTC/USDT · OKX 公共行情。此版本仅手动刷新。",
     actions: [
       { label: "开始显示 / 刷新价格" },
@@ -101,8 +102,10 @@ async function run() {
 
 async function main() {
   try {
+    console.log("BTC 灵动岛 v1.0.1：入口已启动")
     await run()
   } catch (error) {
+    console.error("BTC 灵动岛运行失败", error)
     await Dialog.alert({
       title: "未能完成",
       message: `${error instanceof Error ? error.message : String(error)}\n\n网络失败时，不会把旧价格当作新报价。`,

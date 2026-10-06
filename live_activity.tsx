@@ -1,11 +1,11 @@
 import {
   LiveActivity,
   LiveActivityUI,
-  LiveActivityUIBuilder,
   LiveActivityUIExpandedCenter,
   Text,
   VStack,
 } from "scripting"
+import type { LiveActivityUIBuilder } from "scripting"
 
 export const ACTIVITY_NAME = "BTCIslandManualV1"
 
